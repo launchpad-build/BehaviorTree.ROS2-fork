@@ -16,6 +16,8 @@
 
 #include <memory>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
 #include "behaviortree_cpp/condition_node.h"
@@ -157,6 +159,7 @@ public:
 
 private:
   bool createSubscriber(const std::string& topic_name);
+  void spinUntilMessageAvailable();
 };
 
 //----------------------------------------------------------------
@@ -314,13 +317,44 @@ inline NodeStatus RosTopicSubNode<T>::tick()
     }
     return status;
   };
-  sub_instance_->callback_group_executor.spin_some();
+  this->spinUntilMessageAvailable();
   auto status = CheckStatus(onTick(last_msg_));
   if(!latchLastMessage())
   {
     last_msg_.reset();
   }
   return status;
+}
+
+template <class T>
+void RosTopicSubNode<T>::spinUntilMessageAvailable()
+{
+  auto spin_some = [this]() {
+    sub_instance_->callback_group_executor.spin_some();
+  };
+
+  if (!last_msg_) 
+  {
+    auto start_time = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::milliseconds(50);
+    
+    auto should_continue_spin = [this](const auto& start_time, const auto& timeout) {
+      return !last_msg_ && (std::chrono::steady_clock::now() - start_time) < timeout;
+    };
+
+    while (should_continue_spin(start_time, timeout)) 
+    {
+      spin_some();
+      if (!last_msg_) 
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  } 
+  else 
+  {
+    spin_some();
+  }
 }
 
 }  // namespace BT
