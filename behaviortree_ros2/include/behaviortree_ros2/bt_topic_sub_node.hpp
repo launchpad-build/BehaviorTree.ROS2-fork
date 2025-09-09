@@ -338,10 +338,15 @@ void RosTopicSubNode<T>::spinUntilMessageAvailable()
     auto start_time = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::milliseconds(50);
     
-    while (!last_msg_ && (std::chrono::steady_clock::now() - start_time) < timeout) 
+    auto should_continue_spin = [this](const auto& start_time, const auto& timeout) {
+      return !last_msg_ && (std::chrono::steady_clock::now() - start_time) < timeout;
+    };
+
+    while (should_continue_spin(start_time, timeout)) 
     {
       spin_some();
-      if (!last_msg_) {
+      if (!last_msg_) 
+      {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
     }
