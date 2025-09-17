@@ -329,31 +329,26 @@ inline NodeStatus RosTopicSubNode<T>::tick()
 template <class T>
 void RosTopicSubNode<T>::spinUntilMessageAvailable()
 {
-  auto spin_some = [this]() {
+  auto spin_some = [this]()
+  {
     sub_instance_->callback_group_executor.spin_some();
   };
 
-  if (!last_msg_) 
-  {
-    auto start_time = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::milliseconds(50);
-    
-    auto should_continue_spin = [this](const auto& start_time, const auto& timeout) {
-      return !last_msg_ && (std::chrono::steady_clock::now() - start_time) < timeout;
-    };
+  auto start_time = std::chrono::steady_clock::now();
+  const auto timeout = std::chrono::milliseconds(1000);
+  std::shared_ptr<T> previous_msg = last_msg_;
 
-    while (should_continue_spin(start_time, timeout)) 
-    {
-      spin_some();
-      if (!last_msg_) 
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-    }
-  } 
-  else 
+  auto should_continue_spin = [this, &previous_msg](const auto& start_time, const auto& timeout) 
+  {
+    bool has_new_message = last_msg_ && (last_msg_ != previous_msg);
+    bool within_timeout = (std::chrono::steady_clock::now() - start_time) < timeout;
+    return !has_new_message && within_timeout;
+  };
+
+  while (should_continue_spin(start_time, timeout))
   {
     spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
 
