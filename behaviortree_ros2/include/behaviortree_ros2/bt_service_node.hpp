@@ -148,6 +148,7 @@ protected:
     ServiceClientPtr service_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_executor;
+    bool use_internal_executor = false; // Flag to indicate if internal executor is active
   };
 
   static std::mutex& getMutex()
@@ -212,12 +213,24 @@ template <class T>
 inline RosServiceNode<T>::ServiceClientInstance::ServiceClientInstance(
     std::shared_ptr<rclcpp::Node> node, const std::string& service_name)
 {
+  RCLCPP_DEBUG(node->get_logger(), "Creating callback group for service: %s", service_name.c_str());
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-  callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+
+  // Try to add callback group to internal executor, but handle gracefully if already managed
+  try {
+    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+    use_internal_executor = true;
+    RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for service: %s", service_name.c_str());
+  } catch (const std::runtime_error& e) {
+    // This is expected when the node is already managed by an external executor
+    use_internal_executor = false;
+    RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for service: %s - %s", service_name.c_str(), e.what());
+  }
 
   service_client = node->create_client<T>(service_name, rmw_qos_profile_services_default,
                                           callback_group);
+  RCLCPP_DEBUG(node->get_logger(), "Created service client for: %s", service_name.c_str());
 }
 
 template <class T>
@@ -370,7 +383,10 @@ inline NodeStatus RosServiceNode<T>::tick()
 
   if(status() == NodeStatus::RUNNING)
   {
-    srv_instance_->callback_executor.spin_some();
+    if(srv_instance_->use_internal_executor)
+    {
+      srv_instance_->callback_executor.spin_some();
+    }
 
     // FIRST case: check if the goal request has a timeout
     if(!response_received_)
@@ -379,8 +395,20 @@ inline NodeStatus RosServiceNode<T>::tick()
       auto const timeout =
           rclcpp::Duration::from_seconds(double(service_timeout_.count()) / 1000);
 
-      auto ret = srv_instance_->callback_executor.spin_until_future_complete(
-          future_response_, nodelay);
+      rclcpp::FutureReturnCode ret;
+      if(srv_instance_->use_internal_executor)
+      {
+        ret = srv_instance_->callback_executor.spin_until_future_complete(
+            future_response_, nodelay);
+      }
+      else
+      {
+        // When external executor is managing callbacks, just check future status
+        auto status = future_response_.wait_for(nodelay);
+        ret = (status == std::future_status::ready) ?
+              rclcpp::FutureReturnCode::SUCCESS :
+              rclcpp::FutureReturnCode::TIMEOUT;
+      }
 
       if(ret != rclcpp::FutureReturnCode::SUCCESS)
       {
