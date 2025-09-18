@@ -60,6 +60,7 @@ protected:
     rclcpp::executors::SingleThreadedExecutor callback_group_executor;
     boost::signals2::signal<void(const std::shared_ptr<TopicT>)> broadcaster;
     std::shared_ptr<TopicT> last_msg;
+    bool use_internal_executor = false; // Flag to indicate if internal executor is active
   };
 
   static std::mutex& registryMutex()
@@ -169,11 +170,21 @@ template <class T>
 inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
     std::shared_ptr<rclcpp::Node> node, const std::string& topic_name)
 {
+  RCLCPP_DEBUG(node->get_logger(), "Creating callback group for topic: %s", topic_name.c_str());
   // create a callback group for this particular instance
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-  callback_group_executor.add_callback_group(callback_group,
-                                             node->get_node_base_interface());
+  // Try to add callback group to internal executor, but handle gracefully if already managed
+  try {
+    callback_group_executor.add_callback_group(callback_group,
+                                               node->get_node_base_interface());
+    use_internal_executor = true;
+    RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for topic: %s", topic_name.c_str());
+  } catch (const std::runtime_error& e) {
+    // This is expected when the node is already managed by an external executor
+    use_internal_executor = false;
+    RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for topic: %s - %s", topic_name.c_str(), e.what());
+  }
 
   rclcpp::SubscriptionOptions option;
   option.callback_group = callback_group;
@@ -331,7 +342,10 @@ void RosTopicSubNode<T>::spinUntilMessageAvailable()
 {
   auto spin_some = [this]()
   {
-    sub_instance_->callback_group_executor.spin_some();
+    if(sub_instance_->use_internal_executor)
+    {
+      sub_instance_->callback_group_executor.spin_some();
+    }
   };
 
   auto start_time = std::chrono::steady_clock::now();

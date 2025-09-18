@@ -180,6 +180,7 @@ protected:
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_executor;
     typename ActionClient::SendGoalOptions goal_options;
+    bool use_internal_executor = false; // Flag to indicate if internal executor is active
   };
 
   static std::mutex& getMutex()
@@ -243,10 +244,21 @@ template <class T>
 RosActionNode<T>::ActionClientInstance::ActionClientInstance(
     std::shared_ptr<rclcpp::Node> node, const std::string& action_name)
 {
+  RCLCPP_DEBUG(node->get_logger(), "Creating callback group for action: %s", action_name.c_str());
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+  // Try to add callback group to internal executor, but handle gracefully if already managed
+  try {
+    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+    use_internal_executor = true;
+    RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for action: %s", action_name.c_str());
+  } catch (const std::runtime_error& e) {
+    // This is expected when the node is already managed by an external executor
+    use_internal_executor = false;
+    RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for action: %s - %s", action_name.c_str(), e.what());
+  }
   action_client = rclcpp_action::create_client<T>(node, action_name, callback_group);
+  RCLCPP_DEBUG(node->get_logger(), "Created action client for: %s", action_name.c_str());
 }
 
 template <class T>
@@ -444,7 +456,10 @@ inline NodeStatus RosActionNode<T>::tick()
   if(status() == NodeStatus::RUNNING)
   {
     std::unique_lock<std::mutex> lock(getMutex());
-    client_instance_->callback_executor.spin_some();
+    if(client_instance_->use_internal_executor)
+    {
+      client_instance_->callback_executor.spin_some();
+    }
 
     // FIRST case: check if the goal request has a timeout
     if(!goal_received_)
@@ -453,8 +468,21 @@ inline NodeStatus RosActionNode<T>::tick()
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
 
-      auto ret = client_instance_->callback_executor.spin_until_future_complete(
-          future_goal_handle_, nodelay);
+      rclcpp::FutureReturnCode ret;
+      if(client_instance_->use_internal_executor)
+      {
+        ret = client_instance_->callback_executor.spin_until_future_complete(
+            future_goal_handle_, nodelay);
+      }
+      else
+      {
+        // When external executor is managing callbacks, just check future status
+        auto status = future_goal_handle_.wait_for(nodelay);
+        ret = (status == std::future_status::ready) ?
+              rclcpp::FutureReturnCode::SUCCESS :
+              rclcpp::FutureReturnCode::TIMEOUT;
+      }
+      
       if(ret != rclcpp::FutureReturnCode::SUCCESS)
       {
         if((now() - time_goal_sent_) > timeout)
