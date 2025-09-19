@@ -224,7 +224,6 @@ protected:
   const std::chrono::milliseconds wait_for_server_timeout_;
   std::string action_client_key_;
 
-private:
   std::shared_future<typename GoalHandle::SharedPtr> future_goal_handle_;
   typename GoalHandle::SharedPtr goal_handle_;
 

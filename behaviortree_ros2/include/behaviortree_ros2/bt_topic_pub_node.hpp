@@ -89,7 +89,6 @@ protected:
   std::string prev_topic_name_;
   bool topic_name_may_change_ = false;
 
-private:
   std::shared_ptr<Publisher> publisher_;
 
   bool createPublisher(const std::string& topic_name);

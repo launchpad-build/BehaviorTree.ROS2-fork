@@ -158,7 +158,6 @@ public:
     return false;
   }
 
-private:
   bool createSubscriber(const std::string& topic_name);
   void spinUntilMessageAvailable();
 };
