@@ -72,7 +72,7 @@ public:
     return providedBasicPorts({});
   }
 
-  NodeStatus tick() override final;
+  NodeStatus tick() override;
 
   /**
    * @brief setMessage is a callback invoked in tick to allow the user to pass

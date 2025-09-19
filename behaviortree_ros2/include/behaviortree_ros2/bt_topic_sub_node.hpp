@@ -134,7 +134,7 @@ public:
     return providedBasicPorts({});
   }
 
-  NodeStatus tick() override final;
+  NodeStatus tick() override;
 
   /** Callback invoked in the tick. You must return either SUCCESS of FAILURE
    *
