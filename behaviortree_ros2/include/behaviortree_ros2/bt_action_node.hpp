@@ -174,7 +174,8 @@ protected:
   struct ActionClientInstance
   {
     ActionClientInstance(std::shared_ptr<rclcpp::Node> node,
-                         const std::string& action_name);
+                         const std::string& action_name,
+                         bool use_external_executor = false);
 
     ActionClientPtr action_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
@@ -222,6 +223,7 @@ protected:
   bool action_name_should_be_checked_ = false;
   const std::chrono::milliseconds server_timeout_;
   const std::chrono::milliseconds wait_for_server_timeout_;
+  bool use_external_executor_ = false;
   std::string action_client_key_;
 
 private:
@@ -242,20 +244,32 @@ private:
 
 template <class T>
 RosActionNode<T>::ActionClientInstance::ActionClientInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& action_name)
+    std::shared_ptr<rclcpp::Node> node, const std::string& action_name,
+    bool use_external_executor)
 {
   RCLCPP_DEBUG(node->get_logger(), "Creating callback group for action: %s", action_name.c_str());
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  // Try to add callback group to internal executor, but handle gracefully if already managed
-  try {
-    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
-    use_internal_executor = true;
-    RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for action: %s", action_name.c_str());
-  } catch (const std::runtime_error& e) {
-    // This is expected when the node is already managed by an external executor
+  if(use_external_executor)
+  {
+    // Callbacks are handled by the node's main executor (rclcpp::spin).
+    // Do not add the callback group to the internal executor — this allows
+    // emitWakeUpSignal() to fire during tree.sleep(), making it interruptible.
     use_internal_executor = false;
-    RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for action: %s - %s", action_name.c_str(), e.what());
+    RCLCPP_DEBUG(node->get_logger(), "Using external executor for action: %s", action_name.c_str());
+  }
+  else
+  {
+    // Try to add callback group to internal executor, but handle gracefully if already managed
+    try {
+      callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+      use_internal_executor = true;
+      RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for action: %s", action_name.c_str());
+    } catch (const std::runtime_error& e) {
+      // This is expected when the node is already managed by an external executor
+      use_internal_executor = false;
+      RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for action: %s - %s", action_name.c_str(), e.what());
+    }
   }
   action_client = rclcpp_action::create_client<T>(node, action_name, callback_group);
   RCLCPP_DEBUG(node->get_logger(), "Created action client for: %s", action_name.c_str());
@@ -269,6 +283,7 @@ inline RosActionNode<T>::RosActionNode(const std::string& instance_name,
   , node_(params.nh)
   , server_timeout_(params.server_timeout)
   , wait_for_server_timeout_(params.wait_for_server_timeout)
+  , use_external_executor_(params.use_external_executor)
 {
   // Three cases:
   // - we use the default action_name in RosNodeParams when port is empty
@@ -320,7 +335,7 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
   auto it = registry.find(action_client_key_);
   if(it == registry.end() || it->second.expired())
   {
-    client_instance_ = std::make_shared<ActionClientInstance>(node, action_name);
+    client_instance_ = std::make_shared<ActionClientInstance>(node, action_name, use_external_executor_);
     registry.insert({ action_client_key_, client_instance_ });
   }
   else
@@ -420,7 +435,10 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
-      if(goal_handle_->get_goal_id() == result.goal_id)
+      // goal_handle_ may not yet be set if using an external executor (result can arrive
+      // before tick() processes the future). Since only one goal is active at a time,
+      // the ID check is skipped when goal_handle_ is null — the result must be ours.
+      if(!goal_handle_ || goal_handle_->get_goal_id() == result.goal_id)
       {
         RCLCPP_DEBUG(logger(), "result_callback");
         result_ = result;
