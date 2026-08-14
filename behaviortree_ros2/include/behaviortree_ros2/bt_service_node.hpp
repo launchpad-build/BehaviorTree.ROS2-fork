@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <rclcpp/executors.hpp>
@@ -85,7 +86,11 @@ public:
   explicit RosServiceNode(const std::string& instance_name, const BT::NodeConfig& conf,
                           const BT::RosNodeParams& params);
 
-  virtual ~RosServiceNode() = default;
+  virtual ~RosServiceNode()
+  {
+    node_alive_->store(false);
+    dropPendingRequest();
+  }
 
   /**
    * @brief Any subclass of RosServiceNode that has ports must implement a
@@ -143,7 +148,7 @@ protected:
   struct ServiceClientInstance
   {
     ServiceClientInstance(std::shared_ptr<rclcpp::Node> node,
-                          const std::string& service_name);
+                          const std::string& service_name, bool use_external_executor);
 
     ServiceClientPtr service_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
@@ -190,12 +195,20 @@ protected:
   std::weak_ptr<rclcpp::Node> node_;
   std::string service_name_;
   bool service_name_should_be_checked_ = false;
+  bool use_external_executor_ = false;
   const std::chrono::milliseconds service_timeout_;
   const std::chrono::milliseconds wait_for_service_timeout_;
 
 private:
   std::shared_ptr<ServiceClientInstance> srv_instance_;
   std::shared_future<typename Response::SharedPtr> future_response_;
+  int64_t request_id_ = 0;
+  std::shared_ptr<std::atomic_bool> node_alive_ = std::make_shared<std::atomic_bool>(true);
+
+  /**
+   * @brief Forgets an in-flight request so its response callback stops being tracked
+   */
+  void dropPendingRequest();
 
   rclcpp::Time time_request_sent_;
   NodeStatus on_feedback_state_change_;
@@ -211,21 +224,34 @@ private:
 
 template <class T>
 inline RosServiceNode<T>::ServiceClientInstance::ServiceClientInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& service_name)
+    std::shared_ptr<rclcpp::Node> node, const std::string& service_name,
+    bool use_external_executor)
 {
   RCLCPP_DEBUG(node->get_logger(), "Creating callback group for service: %s", service_name.c_str());
-  callback_group =
-      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  callback_group = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
+                                               use_external_executor);
 
-  // Try to add callback group to internal executor, but handle gracefully if already managed
-  try {
-    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
-    use_internal_executor = true;
-    RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for service: %s", service_name.c_str());
-  } catch (const std::runtime_error& e) {
-    // This is expected when the node is already managed by an external executor
+  if(use_external_executor)
+  {
+    // Callbacks are handled by the node's main executor (rclcpp::spin), which runs
+    // while the tree sleeps. That is what lets the response callback's
+    // emitWakeUpSignal() interrupt tree.sleep() instead of the response waiting
+    // for the next tick.
     use_internal_executor = false;
-    RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for service: %s - %s", service_name.c_str(), e.what());
+    RCLCPP_DEBUG(node->get_logger(), "Using external executor for service: %s", service_name.c_str());
+  }
+  else
+  {
+    // Try to add callback group to internal executor, but handle gracefully if already managed
+    try {
+      callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+      use_internal_executor = true;
+      RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for service: %s", service_name.c_str());
+    } catch (const std::runtime_error& e) {
+      // This is expected when the node is already managed by an external executor
+      use_internal_executor = false;
+      RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for service: %s - %s", service_name.c_str(), e.what());
+    }
   }
 
   service_client = node->create_client<T>(service_name, rmw_qos_profile_services_default,
@@ -242,6 +268,8 @@ inline RosServiceNode<T>::RosServiceNode(const std::string& instance_name,
   , service_timeout_(params.server_timeout)
   , wait_for_service_timeout_(params.wait_for_server_timeout)
 {
+  use_external_executor_ = params.use_external_executor;
+
   // check port remapping
   auto portIt = config().input_ports.find("service_name");
   if(portIt != config().input_ports.end())
@@ -281,13 +309,15 @@ inline bool RosServiceNode<T>::createClient(const std::string& service_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
-  auto client_key = std::string(node->get_fully_qualified_name()) + "/" + service_name;
+  auto client_key = std::string(node->get_fully_qualified_name()) + "/" + service_name + "/" +
+                    (use_external_executor_ ? "external" : "internal");
 
   auto& registry = getRegistry();
   auto it = registry.find(client_key);
   if(it == registry.end() || it->second.expired())
   {
-    srv_instance_ = std::make_shared<ServiceClientInstance>(node, service_name);
+    srv_instance_ =
+        std::make_shared<ServiceClientInstance>(node, service_name, use_external_executor_);
     registry.insert({ client_key, srv_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created service client [%s]", name().c_str(),
@@ -375,7 +405,17 @@ inline NodeStatus RosServiceNode<T>::tick()
       return onFailure(SERVICE_UNREACHABLE);
     }
 
-    future_response_ = srv_instance_->service_client->async_send_request(request).share();
+    auto response_callback = [this, alive = node_alive_](typename ServiceClient::SharedFuture) {
+      // The promise is satisfied before this fires, so the future is ready here.
+      if(alive->load())
+      {
+        emitWakeUpSignal();
+      }
+    };
+    auto pending =
+        srv_instance_->service_client->async_send_request(request, response_callback);
+    request_id_ = pending.request_id;
+    future_response_ = pending.future;
     time_request_sent_ = now();
 
     return NodeStatus::RUNNING;
@@ -414,6 +454,7 @@ inline NodeStatus RosServiceNode<T>::tick()
       {
         if((now() - time_request_sent_) > timeout)
         {
+          dropPendingRequest();
           return CheckStatus(onFailure(SERVICE_TIMEOUT));
         }
         else
@@ -426,6 +467,7 @@ inline NodeStatus RosServiceNode<T>::tick()
         response_received_ = true;
         response_ = future_response_.get();
         future_response_ = {};
+        request_id_ = 0;
 
         if(!response_)
         {
@@ -445,8 +487,20 @@ inline void RosServiceNode<T>::halt()
 {
   if(status() == NodeStatus::RUNNING)
   {
+    dropPendingRequest();
     resetStatus();
   }
+}
+
+template <class T>
+inline void RosServiceNode<T>::dropPendingRequest()
+{
+  if(srv_instance_ && request_id_ != 0)
+  {
+    srv_instance_->service_client->remove_pending_request(request_id_);
+    request_id_ = 0;
+  }
+  future_response_ = {};
 }
 
 }  // namespace BT
