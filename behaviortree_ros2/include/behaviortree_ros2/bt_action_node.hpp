@@ -410,6 +410,9 @@ inline NodeStatus RosActionNode<T>::tick()
 
     goal_received_ = false;
     future_goal_handle_ = {};
+    // A new goal: forget the previous one, or a cancel before this goal is accepted (a pause)
+    // would cancel the old, finished goal and leave this one running.
+    goal_handle_ = {};
     on_feedback_state_change_ = NodeStatus::RUNNING;
     result_ = {};
 
