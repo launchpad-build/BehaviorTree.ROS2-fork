@@ -142,6 +142,12 @@ public:
    */
   virtual BT::NodeStatus onResultReceived(const WrappedResult& result) = 0;
 
+  /// Preserve terminal abort details without changing success or cancellation handling.
+  virtual BT::NodeStatus onAborted(const WrappedResult& /*result*/)
+  {
+    return onFailure(ACTION_ABORTED);
+  }
+
   /** Callback invoked when the feedback is received.
    * It generally returns RUNNING, but the user can also use this callback to cancel the
    * current action and return SUCCESS or FAILURE.
@@ -536,7 +542,7 @@ inline NodeStatus RosActionNode<T>::tick()
     {
       if(result_.code == rclcpp_action::ResultCode::ABORTED)
       {
-        return CheckStatus(onFailure(ACTION_ABORTED));
+        return CheckStatus(onAborted(result_));
       }
       else if(result_.code == rclcpp_action::ResultCode::CANCELED)
       {

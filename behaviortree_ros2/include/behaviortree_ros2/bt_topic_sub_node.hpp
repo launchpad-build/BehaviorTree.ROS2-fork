@@ -145,6 +145,9 @@ public:
    */
   virtual NodeStatus onTick(const std::shared_ptr<TopicT>& last_msg) = 0;
 
+  // Reactive guards can inspect the current sample without blocking motion ticks.
+  virtual bool waitForNewMessage() const { return true; }
+
   /** latch the message that has been processed. If returns false and no new message is
    * received, before next call there will be no message to process. If returns true,
    * the next call will process the same message again, if no new message received.
@@ -328,7 +331,14 @@ inline NodeStatus RosTopicSubNode<T>::tick()
     }
     return status;
   };
-  this->spinUntilMessageAvailable();
+  if(waitForNewMessage())
+  {
+    this->spinUntilMessageAvailable();
+  }
+  else if(sub_instance_->use_internal_executor)
+  {
+    sub_instance_->callback_group_executor.spin_some();
+  }
   auto status = CheckStatus(onTick(last_msg_));
   if(!latchLastMessage())
   {
