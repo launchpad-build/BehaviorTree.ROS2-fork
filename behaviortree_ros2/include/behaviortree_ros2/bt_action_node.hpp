@@ -416,6 +416,7 @@ inline NodeStatus RosActionNode<T>::tick()
     setStatus(NodeStatus::RUNNING);
 
     goal_received_ = false;
+    goal_handle_.reset();
     future_goal_handle_ = {};
     on_feedback_state_change_ = NodeStatus::RUNNING;
     result_ = {};
