@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <rclcpp/executors.hpp>
@@ -571,13 +572,41 @@ template <class T>
 inline void RosActionNode<T>::cancelGoal()
 {
   auto& executor = client_instance_->callback_executor;
+  auto wait_for_future = [&](auto& future) {
+    if(client_instance_->use_internal_executor)
+    {
+      return executor.spin_until_future_complete(future, server_timeout_);
+    }
+
+    // External callbacks complete the future without waking the internal executor.
+    // Bound each wait so ROS shutdown still interrupts cancellation promptly.
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + server_timeout_;
+    const auto poll_interval = Clock::duration(std::chrono::milliseconds(100));
+    while(future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+    {
+      if(!rclcpp::ok())
+      {
+        return rclcpp::FutureReturnCode::INTERRUPTED;
+      }
+      const auto now = Clock::now();
+      if(server_timeout_.count() >= 0 && now >= deadline)
+      {
+        return rclcpp::FutureReturnCode::TIMEOUT;
+      }
+      const auto wait_time = server_timeout_.count() < 0 ? poll_interval :
+                            std::min(poll_interval, deadline - now);
+      future.wait_for(wait_time);
+    }
+    return rclcpp::FutureReturnCode::SUCCESS;
+  };
+
   if(!goal_handle_)
   {
     if(future_goal_handle_.valid())
     {
       // Here the discussion is if we should block or put a timer for the waiting
-      auto ret =
-          executor.spin_until_future_complete(future_goal_handle_, server_timeout_);
+      auto ret = wait_for_future(future_goal_handle_);
       if(ret != rclcpp::FutureReturnCode::SUCCESS)
       {
         // In that case the goal was not accepted or timed out so probably we should do nothing.
@@ -603,13 +632,13 @@ inline void RosActionNode<T>::cancelGoal()
 
   constexpr auto SUCCESS = rclcpp::FutureReturnCode::SUCCESS;
 
-  if(executor.spin_until_future_complete(future_cancel, server_timeout_) != SUCCESS)
+  if(wait_for_future(future_cancel) != SUCCESS)
   {
     RCLCPP_ERROR(logger(), "Failed to cancel action server for [%s]",
                  action_name_.c_str());
   }
 
-  if(executor.spin_until_future_complete(future_result, server_timeout_) != SUCCESS)
+  if(wait_for_future(future_result) != SUCCESS)
   {
     RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
                  action_name_.c_str());
