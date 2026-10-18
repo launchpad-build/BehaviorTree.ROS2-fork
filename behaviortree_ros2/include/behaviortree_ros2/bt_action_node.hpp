@@ -16,8 +16,10 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
@@ -188,11 +190,22 @@ protected:
                          const std::string& action_name,
                          bool use_external_executor = false);
 
+    ~ActionClientInstance()
+    {
+      stop_executor = true;
+      if(executor_thread.joinable())
+      {
+        executor_thread.join();
+      }
+    }
+
     ActionClientPtr action_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_executor;
     typename ActionClient::SendGoalOptions goal_options;
     bool use_internal_executor = false; // Flag to indicate if internal executor is active
+    std::atomic<bool> stop_executor{false};
+    std::thread executor_thread;
   };
 
   static std::mutex& getMutex()
@@ -322,7 +335,8 @@ RosActionNode<T>::ActionClientInstance::ActionClientInstance(
 {
   RCLCPP_DEBUG(node->get_logger(), "Creating callback group for action: %s", action_name.c_str());
   callback_group =
-      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
+                                  use_external_executor);
   if(use_external_executor)
   {
     // Callbacks are handled by the node's main executor (rclcpp::spin).
@@ -333,18 +347,20 @@ RosActionNode<T>::ActionClientInstance::ActionClientInstance(
   }
   else
   {
-    // Try to add callback group to internal executor, but handle gracefully if already managed
-    try {
-      callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
-      use_internal_executor = true;
-      RCLCPP_DEBUG(node->get_logger(), "Added callback group to internal executor for action: %s", action_name.c_str());
-    } catch (const std::runtime_error& e) {
-      // This is expected when the node is already managed by an external executor
-      use_internal_executor = false;
-      RCLCPP_DEBUG(node->get_logger(), "Callback group already managed externally for action: %s - %s", action_name.c_str(), e.what());
-    }
+    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+    use_internal_executor = true;
   }
   action_client = rclcpp_action::create_client<T>(node, action_name, callback_group);
+  if(use_internal_executor)
+  {
+    // A halted tree must not stop delivery of a late acceptance/cancellation.
+    executor_thread = std::thread([this] {
+      while(!stop_executor && rclcpp::ok())
+      {
+        callback_executor.spin_once(std::chrono::milliseconds(100));
+      }
+    });
+  }
   RCLCPP_DEBUG(node->get_logger(), "Created action client for: %s", action_name.c_str());
 }
 
@@ -402,14 +418,15 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
-  action_client_key_ = std::string(node->get_fully_qualified_name()) + "/" + action_name;
+  action_client_key_ = std::string(node->get_fully_qualified_name()) + "/" + action_name +
+                       (use_external_executor_ ? "/external" : "/internal");
 
   auto& registry = getRegistry();
   auto it = registry.find(action_client_key_);
   if(it == registry.end() || it->second.expired())
   {
     client_instance_ = std::make_shared<ActionClientInstance>(node, action_name, use_external_executor_);
-    registry.insert({ action_client_key_, client_instance_ });
+    registry.insert_or_assign(action_client_key_, client_instance_);
   }
   else
   {
@@ -467,12 +484,13 @@ inline NodeStatus RosActionNode<T>::tick()
   auto& action_client = client_instance_->action_client;
 
   //------------------------------------------
-  auto CheckStatus = [](NodeStatus status) {
+  auto Finish = [this](NodeStatus status) {
     if(!isStatusCompleted(status))
     {
       throw LogicError("RosActionNode: the callback must return either SUCCESS nor "
                        "FAILURE");
     }
+    retireCallbacks();
     return status;
   };
 
@@ -494,7 +512,7 @@ inline NodeStatus RosActionNode<T>::tick()
 
     if(!setGoal(goal))
     {
-      return CheckStatus(onFailure(INVALID_GOAL));
+      return Finish(onFailure(INVALID_GOAL));
     }
 
     typename ActionClient::SendGoalOptions goal_options;
@@ -556,7 +574,7 @@ inline NodeStatus RosActionNode<T>::tick()
     // Check if server is ready
     if(!action_client->action_server_is_ready())
     {
-      return onFailure(SERVER_UNREACHABLE);
+      return Finish(onFailure(SERVER_UNREACHABLE));
     }
 
     future_goal_handle_ = action_client->async_send_goal(goal, goal_options);
@@ -568,11 +586,6 @@ inline NodeStatus RosActionNode<T>::tick()
   if(status() == NodeStatus::RUNNING)
   {
     std::unique_lock<std::mutex> lock(getMutex());
-    if(client_instance_->use_internal_executor)
-    {
-      client_instance_->callback_executor.spin_some();
-    }
-
     // FIRST case: check if the goal request has a timeout
     if(!goal_received_)
     {
@@ -580,27 +593,12 @@ inline NodeStatus RosActionNode<T>::tick()
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
 
-      rclcpp::FutureReturnCode ret;
-      if(client_instance_->use_internal_executor)
-      {
-        ret = client_instance_->callback_executor.spin_until_future_complete(
-            future_goal_handle_, nodelay);
-      }
-      else
-      {
-        // When external executor is managing callbacks, just check future status
-        auto status = future_goal_handle_.wait_for(nodelay);
-        ret = (status == std::future_status::ready) ?
-              rclcpp::FutureReturnCode::SUCCESS :
-              rclcpp::FutureReturnCode::TIMEOUT;
-      }
-      
-      if(ret != rclcpp::FutureReturnCode::SUCCESS)
+      if(future_goal_handle_.wait_for(nodelay) != std::future_status::ready)
       {
         if((now() - time_goal_sent_) > timeout)
         {
           cancelOnAcceptance();
-          return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
+          return Finish(onFailure(SEND_GOAL_TIMEOUT));
         }
         else
         {
@@ -615,7 +613,7 @@ inline NodeStatus RosActionNode<T>::tick()
 
         if(!goal_handle_)
         {
-          return CheckStatus(onFailure(GOAL_REJECTED_BY_SERVER));
+          return Finish(onFailure(GOAL_REJECTED_BY_SERVER));
         }
       }
     }
@@ -643,7 +641,7 @@ inline NodeStatus RosActionNode<T>::tick()
     if(on_feedback_state_change_ != NodeStatus::RUNNING)
     {
       cancelGoal();
-      return on_feedback_state_change_;
+      return Finish(on_feedback_state_change_);
     }
     // THIRD case: result received, requested a stop
     if(result_.code != rclcpp_action::ResultCode::UNKNOWN &&
@@ -651,15 +649,15 @@ inline NodeStatus RosActionNode<T>::tick()
     {
       if(result_.code == rclcpp_action::ResultCode::ABORTED)
       {
-        return CheckStatus(onAborted(result_));
+        return Finish(onAborted(result_));
       }
       else if(result_.code == rclcpp_action::ResultCode::CANCELED)
       {
-        return CheckStatus(onFailure(ACTION_CANCELLED));
+        return Finish(onFailure(ACTION_CANCELLED));
       }
       else
       {
-        return CheckStatus(onResultReceived(result_));
+        return Finish(onResultReceived(result_));
       }
     }
   }
@@ -688,14 +686,8 @@ inline void RosActionNode<T>::halt()
 template <class T>
 inline void RosActionNode<T>::cancelGoal()
 {
-  auto& executor = client_instance_->callback_executor;
   auto wait_for_future = [&](auto& future) {
-    if(client_instance_->use_internal_executor)
-    {
-      return executor.spin_until_future_complete(future, server_timeout_);
-    }
-
-    // External callbacks complete the future without waking the internal executor.
+    // The owning executor completes the future independently of tree ticks.
     // Bound each wait so ROS shutdown still interrupts cancellation promptly.
     using Clock = std::chrono::steady_clock;
     const auto deadline = Clock::now() + server_timeout_;

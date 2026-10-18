@@ -10,6 +10,10 @@ Action callbacks deliver feedback and results to a synchronized inbox for that g
 The tree's tick thread invokes the hooks below in both executor modes. Results that
 arrive before acceptance is processed are retained; a stopped or timed-out request
 requests cancellation if its acceptance arrives later.
+Internal mode owns a callback worker for the shared client's lifetime; external
+mode uses the ROS node's executor. Completed or halted nodes detach their inbox
+while pending late-acceptance cancellation remains active for that client's
+lifetime. The client and its executor must remain alive to receive acceptance.
 
 ### bool setGoal(Goal& goal)
 

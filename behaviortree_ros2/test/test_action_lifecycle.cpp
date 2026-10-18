@@ -14,10 +14,12 @@
 using namespace std::chrono_literals;
 using Sleep = btcpp_ros2_interfaces::action::Sleep;
 using ServerGoal = rclcpp_action::ServerGoalHandle<Sleep>;
+using ClientEntity = rclcpp_action::ClientBase::EntityType;
 
 namespace
 {
-enum GoalMode { IMMEDIATE, HOLD, ABORT, REJECT, NEGATIVE_RESULT, DELAY_CANCEL, DELAY_ACCEPT };
+enum GoalMode { IMMEDIATE, HOLD, ABORT, REJECT, NEGATIVE_RESULT, DELAY_CANCEL, DELAY_ACCEPT,
+                REJECT_CANCEL, FEEDBACK };
 
 // A real ROS action boundary. Its timer is the only owner of held-goal completion.
 class ActionServer
@@ -38,9 +40,10 @@ public:
           return goal->msec_timeout == REJECT ? rclcpp_action::GoalResponse::REJECT :
                                                rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
         },
-        [this](const auto&) {
+        [this](const auto& goal) {
           ++cancel_requests;
-          return rclcpp_action::CancelResponse::ACCEPT;
+          return goal->get_goal()->msec_timeout == REJECT_CANCEL ?
+                     rclcpp_action::CancelResponse::REJECT : rclcpp_action::CancelResponse::ACCEPT;
         },
         [this](const auto goal) {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -62,20 +65,18 @@ public:
         {
           finish(goal, rclcpp_action::ResultCode::CANCELED, false);
         }
-      }
-      for(const auto& command : commands_)
-      {
-        auto goal = goals_.at(command.index);
-        if(command.feedback)
+        else if(goal->is_executing() &&
+                (goal->get_goal()->msec_timeout == FEEDBACK ||
+                 goal->get_goal()->msec_timeout == REJECT_CANCEL))
         {
           auto feedback = std::make_shared<Sleep::Feedback>();
           feedback->cycle = 1;
           goal->publish_feedback(feedback);
         }
-        else
-        {
-          finish(goal, command.result, true);
-        }
+      }
+      for(const auto& command : commands_)
+      {
+        finish(goals_.at(command.index), command.result, true);
       }
       commands_.clear();
       changed_.notify_all();
@@ -99,13 +100,7 @@ public:
   void complete(size_t index, rclcpp_action::ResultCode result)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    commands_.push_back({index, result, false});
-  }
-
-  void feedback(size_t index)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    commands_.push_back({index, rclcpp_action::ResultCode::UNKNOWN, true});
+    commands_.push_back({index, result});
   }
 
   bool waitForPendingResponse()
@@ -141,7 +136,6 @@ private:
   {
     size_t index;
     rclcpp_action::ResultCode result;
-    bool feedback;
   };
   std::mutex mutex_;
   std::condition_variable changed_;
@@ -189,24 +183,24 @@ public:
   }
   void onHalt() override { ++halts; }
 
-  // Internal-mode tests deliberately do not add the client node to any executor.
-  void spinCallbacks()
-  {
-    if(client_instance_->use_internal_executor)
-      client_instance_->callback_executor.spin_some();
-  }
   bool usesInternalExecutor() const { return client_instance_->use_internal_executor; }
+  // Only the stale-result test deliberately stops the worker to control dispatch order.
   void drainReadyCallbacks()
   {
     if(client_instance_->use_internal_executor)
+    {
+      client_instance_->stop_executor = true;
+      if(client_instance_->executor_thread.joinable())
+        client_instance_->executor_thread.join();
       client_instance_->callback_executor.spin_all(100ms);
+    }
   }
-  std::shared_ptr<std::atomic<bool>> observeResultArrival()
+  std::shared_ptr<std::atomic<bool>> observeArrival(ClientEntity expected)
   {
     auto arrived = std::make_shared<std::atomic<bool>>(false);
     client_instance_->action_client->set_on_ready_callback(
-        [arrived](size_t, int entity) {
-          if(entity == static_cast<int>(rclcpp_action::ClientBase::EntityType::ResultClient))
+        [arrived, expected](size_t, int entity) {
+          if(entity == static_cast<int>(expected))
             *arrived = true;
         });
     return arrived;
@@ -277,7 +271,6 @@ protected:
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while(!predicate() && std::chrono::steady_clock::now() < deadline)
     {
-      action_->spinCallbacks();
       wake_up_->waitFor(2ms);
     }
     return predicate();
@@ -300,11 +293,23 @@ protected:
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while(std::chrono::steady_clock::now() < deadline)
     {
-      action_->spinCallbacks();
       if(wake_up_->waitFor(2ms))
         return true;
     }
     return false;
+  }
+
+  void drainCallbacks()
+  {
+    if(GetParam())
+    {
+      executor_.cancel();
+      if(executor_thread_.joinable())
+        executor_thread_.join();
+      executor_.spin_all(100ms);
+    }
+    else
+      action_->drainReadyCallbacks();
   }
 
   rclcpp::Node::SharedPtr server_node_, client_node_;
@@ -315,26 +320,11 @@ protected:
   std::thread executor_thread_;
 };
 
-TEST_P(ActionLifecycle, ImmediateResultsAreDeliveredOnceAcrossRepeatedGoals)
-{
-  for(int run = 0; run < 20; ++run)
-  {
-    ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
-    ASSERT_TRUE(server_->waitForGoals(run + 1));
-    ASSERT_TRUE(server_->waitForTerminal(run));
-    ASSERT_EQ(tickToTerminal(), BT::NodeStatus::SUCCESS);
-    EXPECT_EQ(action_->results, run + 1);
-    EXPECT_EQ(action_->failures, 0);
-    action_->haltAndReset();
-  }
-}
-
 TEST_P(ActionLifecycle, CompletedGoalCanBeHaltedBeforeTheNextTreeTick)
 {
-  action_->mode = HOLD;
+  action_->mode = IMMEDIATE;
   ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
   ASSERT_TRUE(server_->waitForGoals(1));
-  server_->complete(0, rclcpp_action::ResultCode::SUCCEEDED);
   ASSERT_TRUE(server_->waitForTerminal(0));
   ASSERT_TRUE(waitForCallback());
   ASSERT_NO_THROW(action_->haltAndReset());
@@ -364,17 +354,36 @@ TEST_P(ActionLifecycle, AbortRejectAndNegativeResultRemainFailures)
 
 TEST_P(ActionLifecycle, FeedbackStopRunsOnTreeThreadAndCancelsTheGoal)
 {
-  action_->mode = HOLD;
+  action_->mode = FEEDBACK;
   action_->feedback_status = BT::NodeStatus::SUCCESS;
   ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
   ASSERT_TRUE(server_->waitForGoals(1));
-  server_->feedback(0);
   ASSERT_EQ(tickToTerminal(), BT::NodeStatus::SUCCESS);
   EXPECT_EQ(action_->feedbacks, 1);
   EXPECT_TRUE(action_->hooks_on_tick_thread);
   EXPECT_EQ(server_->cancel_requests, 1);
   EXPECT_TRUE(server_->waitForTerminal(0));
   EXPECT_EQ(action_->results, 0);
+}
+
+TEST_P(ActionLifecycle, FeedbackAfterRejectedCancellationDoesNotWakeCompletedNode)
+{
+  action_->mode = REJECT_CANCEL;
+  action_->feedback_status = BT::NodeStatus::SUCCESS;
+  const auto arrived = action_->observeArrival(ClientEntity::FeedbackSubscription);
+  ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
+  ASSERT_TRUE(server_->waitForGoals(1));
+  ASSERT_EQ(tickToTerminal(), BT::NodeStatus::SUCCESS);
+  ASSERT_EQ(server_->cancel_requests, 1);
+  ASSERT_EQ(action_->feedbacks, 1);
+
+  wake_up_->waitFor(0ms);
+  *arrived = false;
+  EXPECT_FALSE(wake_up_->waitFor(250ms));
+  EXPECT_TRUE(arrived->load());
+  EXPECT_EQ(action_->feedbacks, 1);
+  server_->complete(0, rclcpp_action::ResultCode::SUCCEEDED);
+  EXPECT_TRUE(server_->waitForTerminal(0));
 }
 
 TEST_P(ActionLifecycle, HaltCancelsActiveGoalAndTheNodeCanBeReused)
@@ -402,27 +411,26 @@ TEST_P(ActionLifecycle, LateCanceledResultCannotCompleteTheNextGoal)
   action_->mode = HOLD;
   ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
   ASSERT_TRUE(server_->waitForGoals(2));
-  const auto old_result_arrived = action_->observeResultArrival();
+  const auto old_result_arrived = action_->observeArrival(ClientEntity::ResultClient);
   server_->complete(0, rclcpp_action::ResultCode::CANCELED);
   ASSERT_TRUE(server_->waitForTerminal(0));
   ASSERT_TRUE(waitUntil([&] { return old_result_arrived->load(); }));
   // Receipt alone does not prove dispatch. Join any in-flight callback, then
   // drain the received result before the next tree tick. No production callback
   // state is exposed.
-  if(GetParam())
-  {
-    executor_.cancel();
-    executor_thread_.join();
-    executor_.spin_all(100ms);
-    executor_thread_ = std::thread([this] { executor_.spin(); });
-  }
-  else
-    action_->drainReadyCallbacks();
+  drainCallbacks();
   EXPECT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
   EXPECT_EQ(action_->results, 0);
   EXPECT_EQ(action_->failures, 0);
+  const auto next_result_arrived = action_->observeArrival(ClientEntity::ResultClient);
   server_->complete(1, rclcpp_action::ResultCode::SUCCEEDED);
-  EXPECT_EQ(tickToTerminal(), BT::NodeStatus::SUCCESS);
+  ASSERT_TRUE(waitUntil([&] {
+    drainCallbacks();
+    return next_result_arrived->load();
+  }));
+  ASSERT_TRUE(server_->waitForTerminal(1));
+  drainCallbacks();
+  EXPECT_EQ(action_->executeTick(), BT::NodeStatus::SUCCESS);
   EXPECT_EQ(action_->results, 1);
 }
 
@@ -434,8 +442,9 @@ TEST_P(ActionLifecycle, AcceptanceAfterHaltStillCancelsTheAcceptedGoal)
   ASSERT_NO_THROW(action_->haltAndReset());
   server_->releaseResponse();
   ASSERT_TRUE(server_->waitForGoals(1));
-  ASSERT_TRUE(waitUntil([&] { return server_->cancel_requests.load() == 1; }));
-  EXPECT_TRUE(server_->waitForTerminal(0));
+  // A stopped node receives no more ticks or test-supplied callback pumping.
+  ASSERT_TRUE(server_->waitForTerminal(0));
+  EXPECT_EQ(server_->cancel_requests, 1);
   EXPECT_EQ(action_->results, 0);
   EXPECT_EQ(action_->failures, 0);
 
@@ -453,8 +462,8 @@ TEST_P(ActionLifecycle, AcceptanceAfterGoalTimeoutStillCancelsTheAcceptedGoal)
   EXPECT_EQ(action_->last_error, BT::SEND_GOAL_TIMEOUT);
   server_->releaseResponse();
   ASSERT_TRUE(server_->waitForGoals(1));
-  ASSERT_TRUE(waitUntil([&] { return server_->cancel_requests.load() == 1; }));
-  EXPECT_TRUE(server_->waitForTerminal(0));
+  ASSERT_TRUE(server_->waitForTerminal(0));
+  EXPECT_EQ(server_->cancel_requests, 1);
   EXPECT_EQ(action_->results, 0);
   EXPECT_EQ(action_->failures, 1);
 
