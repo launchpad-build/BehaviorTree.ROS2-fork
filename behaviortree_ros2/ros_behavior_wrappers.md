@@ -6,6 +6,17 @@ Users are expected to create a derived class and can implement the following met
 
 # ROS Action Behavior Wrapper
 
+Action callbacks deliver feedback and results to a synchronized inbox for that goal.
+The tree's tick thread invokes the hooks below. Results that
+arrive before acceptance is processed are retained; a stopped or timed-out request
+requests cancellation if its acceptance arrives later.
+The caller must continuously spin the ROS node on a separate thread, including
+while the tree is halted. Action clients do not own an executor or worker thread;
+`RosNodeParams::use_external_executor` applies only to service clients. Completed
+or halted nodes detach their inbox while pending late-acceptance cancellation
+remains active for that client's lifetime. The client and its executor must remain
+alive to receive acceptance.
+
 ### bool setGoal(Goal& goal)
 
 Required callback that allows the user to set the goal message.

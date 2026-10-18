@@ -41,10 +41,8 @@ struct RosNodeParams
   // timeout used when detecting the server the first time
   std::chrono::milliseconds wait_for_server_timeout = std::chrono::milliseconds(500);
 
-  // When true, action callbacks are handled by an external executor (e.g. the node's main
-  // rclcpp::spin). The internal per-action SingleThreadedExecutor is not used, which means
-  // emitWakeUpSignal() can fire during tree.sleep() — making it interruptible.
-  // Requires the calling code to spin the node continuously on a separate thread.
+  // Service clients only: use the node's external executor instead of spinning
+  // internally. Action clients always require an external executor.
   bool use_external_executor = false;
 
   RosNodeParams() = default;
