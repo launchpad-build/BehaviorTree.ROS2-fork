@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <vector>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
 #include "behaviortree_cpp/action_node.h"
@@ -98,7 +99,10 @@ public:
   explicit RosActionNode(const std::string& instance_name, const BT::NodeConfig& conf,
                          const RosNodeParams& params);
 
-  virtual ~RosActionNode() = default;
+  virtual ~RosActionNode()
+  {
+    retireCallbacks();
+  }
 
   /**
    * @brief Any subclass of RosActionNode that has ports must implement a
@@ -149,7 +153,7 @@ public:
     return onFailure(ACTION_ABORTED);
   }
 
-  /** Callback invoked when the feedback is received.
+  /** Callback invoked on the tick thread for each received feedback message.
    * It generally returns RUNNING, but the user can also use this callback to cancel the
    * current action and return SUCCESS or FAILURE.
    */
@@ -234,6 +238,68 @@ protected:
   std::string action_client_key_;
 
 private:
+  // Each send owns its inbox. ROS callbacks only deliver data and wake the tree;
+  // the tick thread owns goal handles and invokes the derived node's hooks.
+  struct CallbackState
+  {
+    std::mutex mutex;
+    RosActionNode* owner;
+    std::vector<std::shared_ptr<const Feedback>> feedback;
+    WrappedResult result{};
+    typename GoalHandle::WeakPtr accepted_handle;
+    bool cancel_on_accept = false;
+  };
+
+  void retireCallbacks()
+  {
+    if(callback_state_)
+    {
+      std::lock_guard<std::mutex> lock(callback_state_->mutex);
+      callback_state_->owner = nullptr;
+      callback_state_->feedback.clear();
+    }
+  }
+
+  bool resultReceived()
+  {
+    std::lock_guard<std::mutex> lock(callback_state_->mutex);
+    return callback_state_->result.code != rclcpp_action::ResultCode::UNKNOWN &&
+           goal_handle_ && callback_state_->result.goal_id == goal_handle_->get_goal_id();
+  }
+
+  static void cancelAcceptedGoal(const std::shared_ptr<CallbackState>& state,
+                                 const ActionClientPtr& client,
+                                 const typename GoalHandle::SharedPtr& handle)
+  {
+    try
+    {
+      client->async_cancel_goal(handle);
+    }
+    catch(const rclcpp_action::exceptions::UnknownGoalHandleError&)
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if(state->result.code == rclcpp_action::ResultCode::UNKNOWN)
+      {
+        throw;
+      }
+    }
+  }
+
+  void cancelOnAcceptance()
+  {
+    typename GoalHandle::SharedPtr accepted;
+    {
+      std::lock_guard<std::mutex> lock(callback_state_->mutex);
+      callback_state_->cancel_on_accept = true;
+      accepted = callback_state_->accepted_handle.lock();
+    }
+    if(accepted)
+    {
+      cancelAcceptedGoal(callback_state_, client_instance_->action_client, accepted);
+    }
+  }
+
+  std::shared_ptr<CallbackState> callback_state_;
   std::shared_future<typename GoalHandle::SharedPtr> future_goal_handle_;
   typename GoalHandle::SharedPtr goal_handle_;
 
@@ -420,6 +486,9 @@ inline NodeStatus RosActionNode<T>::tick()
     future_goal_handle_ = {};
     on_feedback_state_change_ = NodeStatus::RUNNING;
     result_ = {};
+    retireCallbacks();
+    callback_state_ = std::make_shared<CallbackState>();
+    callback_state_->owner = this;
 
     Goal goal;
 
@@ -432,38 +501,55 @@ inline NodeStatus RosActionNode<T>::tick()
 
     //--------------------
     goal_options.feedback_callback =
-        [this](typename GoalHandle::SharedPtr,
+        [state = callback_state_](typename GoalHandle::SharedPtr,
                const std::shared_ptr<const Feedback> feedback) {
-          on_feedback_state_change_ = onFeedback(feedback);
-          if(on_feedback_state_change_ == NodeStatus::IDLE)
+          std::lock_guard<std::mutex> lock(state->mutex);
+          if(state->owner)
           {
-            throw std::logic_error("onFeedback must not return IDLE");
+            state->feedback.push_back(feedback);
+            state->owner->emitWakeUpSignal();
           }
-          emitWakeUpSignal();
         };
     //--------------------
-    goal_options.result_callback = [this](const WrappedResult& result) {
-      // goal_handle_ may not yet be set if using an external executor (result can arrive
-      // before tick() processes the future). Since only one goal is active at a time,
-      // the ID check is skipped when goal_handle_ is null — the result must be ours.
-      if(!goal_handle_ || goal_handle_->get_goal_id() == result.goal_id)
+    goal_options.result_callback = [state = callback_state_](const WrappedResult& result) {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->result = result;
+      if(state->owner)
       {
-        RCLCPP_DEBUG(logger(), "result_callback");
-        result_ = result;
-        emitWakeUpSignal();
+        state->owner->emitWakeUpSignal();
       }
     };
     //--------------------
     goal_options.goal_response_callback =
-        [this](typename GoalHandle::SharedPtr const future_handle) {
-          auto goal_handle_ = future_handle.get();
-          if(!goal_handle_)
+        [state = callback_state_, client = std::weak_ptr<ActionClient>(action_client),
+         log = logger()](typename GoalHandle::SharedPtr const handle) {
+          if(!handle)
           {
-            RCLCPP_ERROR(logger(), "Goal was rejected by server");
+            RCLCPP_ERROR(log, "Goal was rejected by server");
           }
           else
           {
-            RCLCPP_DEBUG(logger(), "Goal accepted by server, waiting for result");
+            RCLCPP_DEBUG(log, "Goal accepted by server, waiting for result");
+            bool cancel;
+            {
+              std::lock_guard<std::mutex> lock(state->mutex);
+              state->accepted_handle = handle;
+              cancel = state->cancel_on_accept;
+            }
+            if(cancel)
+            {
+              if(auto active_client = client.lock())
+              {
+                try
+                {
+                  cancelAcceptedGoal(state, active_client, handle);
+                }
+                catch(const std::exception& error)
+                {
+                  RCLCPP_ERROR(log, "Failed to cancel a late accepted goal: %s", error.what());
+                }
+              }
+            }
           }
         };
     //--------------------
@@ -513,6 +599,7 @@ inline NodeStatus RosActionNode<T>::tick()
       {
         if((now() - time_goal_sent_) > timeout)
         {
+          cancelOnAcceptance();
           return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
         }
         else
@@ -533,6 +620,25 @@ inline NodeStatus RosActionNode<T>::tick()
       }
     }
 
+    std::vector<std::shared_ptr<const Feedback>> feedback;
+    {
+      std::lock_guard<std::mutex> callback_lock(callback_state_->mutex);
+      feedback = std::move(callback_state_->feedback);
+      result_ = callback_state_->result;
+    }
+    for(const auto& message : feedback)
+    {
+      on_feedback_state_change_ = onFeedback(message);
+      if(on_feedback_state_change_ == NodeStatus::IDLE)
+      {
+        throw std::logic_error("onFeedback must not return IDLE");
+      }
+      if(on_feedback_state_change_ != NodeStatus::RUNNING)
+      {
+        break;
+      }
+    }
+
     // SECOND case: onFeedback requested a stop
     if(on_feedback_state_change_ != NodeStatus::RUNNING)
     {
@@ -540,7 +646,8 @@ inline NodeStatus RosActionNode<T>::tick()
       return on_feedback_state_change_;
     }
     // THIRD case: result received, requested a stop
-    if(result_.code != rclcpp_action::ResultCode::UNKNOWN)
+    if(result_.code != rclcpp_action::ResultCode::UNKNOWN &&
+       result_.goal_id == goal_handle_->get_goal_id())
     {
       if(result_.code == rclcpp_action::ResultCode::ABORTED)
       {
@@ -564,7 +671,16 @@ inline void RosActionNode<T>::halt()
 {
   if(status() == BT::NodeStatus::RUNNING)
   {
-    cancelGoal();
+    try
+    {
+      cancelGoal();
+    }
+    catch(...)
+    {
+      retireCallbacks();
+      throw;
+    }
+    retireCallbacks();
     onHalt();
   }
 }
@@ -610,7 +726,8 @@ inline void RosActionNode<T>::cancelGoal()
       auto ret = wait_for_future(future_goal_handle_);
       if(ret != rclcpp::FutureReturnCode::SUCCESS)
       {
-        // In that case the goal was not accepted or timed out so probably we should do nothing.
+        // Stop still owns a request whose acceptance arrives after this wait.
+        cancelOnAcceptance();
         return;
       }
       else
@@ -628,8 +745,29 @@ inline void RosActionNode<T>::cancelGoal()
 
   auto& action_client = client_instance_->action_client;
 
-  auto future_result = action_client->async_get_result(goal_handle_);
-  auto future_cancel = action_client->async_cancel_goal(goal_handle_);
+  // A fast goal can finish before the tree ticks again. ROS has already retired
+  // its handle in that case; do not query or cancel that completed goal.
+  if(!goal_handle_ || resultReceived())
+  {
+    return;
+  }
+
+  std::shared_future<WrappedResult> future_result;
+  std::shared_future<typename ActionClient::CancelResponse::SharedPtr> future_cancel;
+  try
+  {
+    future_result = action_client->async_get_result(goal_handle_);
+    future_cancel = action_client->async_cancel_goal(goal_handle_);
+  }
+  catch(const rclcpp_action::exceptions::UnknownGoalHandleError&)
+  {
+    // Completion can race the two client calls above.
+    if(resultReceived())
+    {
+      return;
+    }
+    throw;
+  }
 
   constexpr auto SUCCESS = rclcpp::FutureReturnCode::SUCCESS;
 

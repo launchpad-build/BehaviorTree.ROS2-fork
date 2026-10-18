@@ -56,4 +56,12 @@ install(
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_action_lifecycle test/test_action_lifecycle.cpp)
+  target_link_libraries(test_action_lifecycle ${PROJECT_NAME})
+  ament_target_dependencies(test_action_lifecycle rclcpp rclcpp_action
+                            behaviortree_cpp btcpp_ros2_interfaces)
+endif()
+
 ament_package()
