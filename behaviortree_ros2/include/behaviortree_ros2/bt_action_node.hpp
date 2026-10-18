@@ -16,12 +16,9 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
-#include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
 #include "behaviortree_cpp/action_node.h"
 #include "behaviortree_cpp/bt_factory.h"
@@ -74,6 +71,8 @@ inline const char* toStr(const ActionNodeErrorCode& err)
  *
  * RosActionNode will try to be non-blocking for the entire duration of the call.
  * The derived class must reimplement the virtual methods as described below.
+ * The caller must continuously spin the ROS node on a separate thread, including
+ * while the tree is halted, so that cancellation and late replies are processed.
  *
  * The name of the action will be determined as follows:
  *
@@ -187,25 +186,10 @@ protected:
   struct ActionClientInstance
   {
     ActionClientInstance(std::shared_ptr<rclcpp::Node> node,
-                         const std::string& action_name,
-                         bool use_external_executor = false);
-
-    ~ActionClientInstance()
-    {
-      stop_executor = true;
-      if(executor_thread.joinable())
-      {
-        executor_thread.join();
-      }
-    }
+                         const std::string& action_name);
 
     ActionClientPtr action_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
-    rclcpp::executors::SingleThreadedExecutor callback_executor;
-    typename ActionClient::SendGoalOptions goal_options;
-    bool use_internal_executor = false; // Flag to indicate if internal executor is active
-    std::atomic<bool> stop_executor{false};
-    std::thread executor_thread;
   };
 
   static std::mutex& getMutex()
@@ -247,8 +231,6 @@ protected:
   bool action_name_should_be_checked_ = false;
   const std::chrono::milliseconds server_timeout_;
   const std::chrono::milliseconds wait_for_server_timeout_;
-  bool use_external_executor_ = false;
-  std::string action_client_key_;
 
 private:
   // Each send owns its inbox. ROS callbacks only deliver data and wake the tree;
@@ -330,37 +312,12 @@ private:
 
 template <class T>
 RosActionNode<T>::ActionClientInstance::ActionClientInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& action_name,
-    bool use_external_executor)
+    std::shared_ptr<rclcpp::Node> node, const std::string& action_name)
 {
   RCLCPP_DEBUG(node->get_logger(), "Creating callback group for action: %s", action_name.c_str());
   callback_group =
-      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
-                                  use_external_executor);
-  if(use_external_executor)
-  {
-    // Callbacks are handled by the node's main executor (rclcpp::spin).
-    // Do not add the callback group to the internal executor — this allows
-    // emitWakeUpSignal() to fire during tree.sleep(), making it interruptible.
-    use_internal_executor = false;
-    RCLCPP_DEBUG(node->get_logger(), "Using external executor for action: %s", action_name.c_str());
-  }
-  else
-  {
-    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
-    use_internal_executor = true;
-  }
+      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   action_client = rclcpp_action::create_client<T>(node, action_name, callback_group);
-  if(use_internal_executor)
-  {
-    // A halted tree must not stop delivery of a late acceptance/cancellation.
-    executor_thread = std::thread([this] {
-      while(!stop_executor && rclcpp::ok())
-      {
-        callback_executor.spin_once(std::chrono::milliseconds(100));
-      }
-    });
-  }
   RCLCPP_DEBUG(node->get_logger(), "Created action client for: %s", action_name.c_str());
 }
 
@@ -372,7 +329,6 @@ inline RosActionNode<T>::RosActionNode(const std::string& instance_name,
   , node_(params.nh)
   , server_timeout_(params.server_timeout)
   , wait_for_server_timeout_(params.wait_for_server_timeout)
-  , use_external_executor_(params.use_external_executor)
 {
   // Three cases:
   // - we use the default action_name in RosNodeParams when port is empty
@@ -418,15 +374,14 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
-  action_client_key_ = std::string(node->get_fully_qualified_name()) + "/" + action_name +
-                       (use_external_executor_ ? "/external" : "/internal");
+  const auto client_key = std::string(node->get_fully_qualified_name()) + "/" + action_name;
 
   auto& registry = getRegistry();
-  auto it = registry.find(action_client_key_);
+  auto it = registry.find(client_key);
   if(it == registry.end() || it->second.expired())
   {
-    client_instance_ = std::make_shared<ActionClientInstance>(node, action_name, use_external_executor_);
-    registry.insert_or_assign(action_client_key_, client_instance_);
+    client_instance_ = std::make_shared<ActionClientInstance>(node, action_name);
+    registry.insert_or_assign(client_key, client_instance_);
   }
   else
   {
