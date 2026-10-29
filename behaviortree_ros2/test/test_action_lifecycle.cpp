@@ -12,6 +12,7 @@
 
 using namespace std::chrono_literals;
 using Sleep = btcpp_ros2_interfaces::action::Sleep;
+using GetResult = Sleep::Impl::GetResultService;
 using ServerGoal = rclcpp_action::ServerGoalHandle<Sleep>;
 using ClientEntity = rclcpp_action::ClientBase::EntityType;
 
@@ -33,8 +34,11 @@ bool waitUntil(Predicate predicate)
 class ActionServer
 {
 public:
-  ActionServer(const rclcpp::Node::SharedPtr& node, const std::string& name)
+  ActionServer(const rclcpp::Node::SharedPtr& node, const std::string& name,
+               std::chrono::nanoseconds result_retention = 10s)
   {
+    auto options = rcl_action_server_get_default_options();
+    options.result_timeout.nanoseconds = result_retention.count();
     server_ = rclcpp_action::create_server<Sleep>(
         node, name,
         [this](const auto&, const auto goal) {
@@ -56,7 +60,8 @@ public:
           const auto mode = goal->get_goal()->msec_timeout;
           if(mode == IMMEDIATE)
             finish(goal, false);
-        });
+        }, options);
+    result_probe_ = node->create_client<GetResult>(name + "/_action/get_result");
     timer_ = node->create_wall_timer(2ms, [this] {
       std::lock_guard<std::mutex> lock(mutex_);
       for(const auto& goal : goals_)
@@ -97,6 +102,27 @@ public:
     finish(goals_.at(index), canceled);
   }
 
+  rclcpp_action::GoalUUID goalId(size_t index)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return goals_.at(index)->get_goal_id();
+  }
+
+  bool waitForResultExpiration(size_t index)
+  {
+    auto request = std::make_shared<GetResult::Request>();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      request->goal_id.uuid = goals_.at(index)->get_goal_id();
+    }
+    // Observe actual expiry instead of assuming a sleep lets the server timer run.
+    return waitUntil([&] {
+      auto future = result_probe_->async_send_request(request);
+      return future.wait_for(100ms) == std::future_status::ready &&
+             future.get()->status == action_msgs::msg::GoalStatus::STATUS_UNKNOWN;
+    });
+  }
+
   std::atomic<int> cancel_requests{0};
   std::atomic<bool> response_pending{false};
   std::promise<void> release_response;
@@ -115,6 +141,7 @@ private:
   std::mutex mutex_;
   std::vector<std::shared_ptr<ServerGoal>> goals_;
   rclcpp_action::Server<Sleep>::SharedPtr server_;
+  rclcpp::Client<GetResult>::SharedPtr result_probe_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
@@ -167,6 +194,11 @@ public:
     resetStatus();
   }
 
+  void suppressCallbacks(const rclcpp_action::GoalUUID& goal_id)
+  {
+    client_instance_->action_client->stop_callbacks(goal_id);
+  }
+
   int mode = IMMEDIATE;
   std::atomic<int> results{0}, failures{0}, feedbacks{0};
   std::atomic<BT::ActionNodeErrorCode> last_error{BT::INVALID_GOAL};
@@ -182,13 +214,16 @@ protected:
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 
+  virtual std::chrono::nanoseconds resultRetention() const { return 10s; }
+
   void SetUp() override
   {
     static std::atomic<int> sequence{0};
     const auto suffix = std::to_string(++sequence);
     server_node_ = std::make_shared<rclcpp::Node>("server_" + suffix);
     client_node_ = std::make_shared<rclcpp::Node>("client_" + suffix);
-    server_ = std::make_unique<ActionServer>(server_node_, "sleep_" + suffix);
+    server_ = std::make_unique<ActionServer>(server_node_, "sleep_" + suffix,
+                                            resultRetention());
     executor_.add_node(server_node_);
     executor_.add_node(client_node_);
     executor_thread_ = std::thread([this] { executor_.spin(); });
@@ -229,6 +264,49 @@ protected:
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::thread executor_thread_;
 };
+
+class ExpiredResultLifecycle : public ActionLifecycle
+{
+protected:
+  std::chrono::nanoseconds resultRetention() const override { return 20ms; }
+};
+
+TEST_F(ExpiredResultLifecycle, ExpiredImmediateResultFailsInsteadOfWaitingForever)
+{
+  executor_.cancel();
+  executor_thread_.join();
+  executor_.remove_node(client_node_);
+  executor_thread_ = std::thread([this] { executor_.spin(); });
+
+  ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
+  ASSERT_TRUE(server_->waitForTerminal(0));
+  ASSERT_TRUE(server_->waitForResultExpiration(0));
+  executor_.add_node(client_node_);
+
+  EXPECT_EQ(tickToTerminal(), BT::NodeStatus::FAILURE);
+  EXPECT_STREQ(BT::toStr(action_->last_error.load()), "INVALID_RESULT");
+  EXPECT_EQ(action_->results, 0);
+  EXPECT_EQ(action_->failures, 1);
+}
+
+TEST_F(ActionLifecycle, TerminalGoalWithoutResultCallbackFailsAfterGracePeriod)
+{
+  action_->mode = HOLD;
+  ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
+  ASSERT_TRUE(server_->waitForGoals(1));
+  // server_timeout is not an execution deadline for a legitimately running goal.
+  std::this_thread::sleep_for(300ms);
+  ASSERT_EQ(action_->executeTick(), BT::NodeStatus::RUNNING);
+
+  action_->suppressCallbacks(server_->goalId(0));
+  server_->complete(0);
+  ASSERT_TRUE(server_->waitForTerminal(0));
+  EXPECT_EQ(tickToTerminal(), BT::NodeStatus::FAILURE);
+  EXPECT_STREQ(BT::toStr(action_->last_error.load()), "RESULT_TIMEOUT");
+  EXPECT_EQ(action_->results, 0);
+  EXPECT_EQ(action_->failures, 1);
+  EXPECT_EQ(server_->cancel_requests, 0);
+}
 
 TEST_F(ActionLifecycle, CompletedGoalCanBeHaltedBeforeTheNextTreeTick)
 {

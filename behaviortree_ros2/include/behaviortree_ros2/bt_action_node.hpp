@@ -16,7 +16,9 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <rclcpp/allocator/allocator_common.hpp>
@@ -36,7 +38,9 @@ enum ActionNodeErrorCode
   GOAL_REJECTED_BY_SERVER,
   ACTION_ABORTED,
   ACTION_CANCELLED,
-  INVALID_GOAL
+  INVALID_GOAL,
+  INVALID_RESULT,
+  RESULT_TIMEOUT
 };
 
 inline const char* toStr(const ActionNodeErrorCode& err)
@@ -55,6 +59,10 @@ inline const char* toStr(const ActionNodeErrorCode& err)
       return "ACTION_CANCELLED";
     case INVALID_GOAL:
       return "INVALID_GOAL";
+    case INVALID_RESULT:
+      return "INVALID_RESULT";
+    case RESULT_TIMEOUT:
+      return "RESULT_TIMEOUT";
   }
   return nullptr;
 }
@@ -240,7 +248,7 @@ private:
     std::mutex mutex;
     RosActionNode* owner;
     std::vector<std::shared_ptr<const Feedback>> feedback;
-    WrappedResult result{};
+    std::optional<WrappedResult> result;
     typename GoalHandle::WeakPtr accepted_handle;
     bool cancel_on_accept = false;
   };
@@ -258,8 +266,8 @@ private:
   bool resultReceived()
   {
     std::lock_guard<std::mutex> lock(callback_state_->mutex);
-    return callback_state_->result.code != rclcpp_action::ResultCode::UNKNOWN &&
-           goal_handle_ && callback_state_->result.goal_id == goal_handle_->get_goal_id();
+    return callback_state_->result && goal_handle_ &&
+           callback_state_->result->goal_id == goal_handle_->get_goal_id();
   }
 
   static void cancelAcceptedGoal(const std::shared_ptr<CallbackState>& state,
@@ -273,7 +281,7 @@ private:
     catch(const rclcpp_action::exceptions::UnknownGoalHandleError&)
     {
       std::lock_guard<std::mutex> lock(state->mutex);
-      if(state->result.code == rclcpp_action::ResultCode::UNKNOWN)
+      if(!state->result)
       {
         throw;
       }
@@ -301,7 +309,7 @@ private:
   rclcpp::Time time_goal_sent_;
   NodeStatus on_feedback_state_change_;
   bool goal_received_;
-  WrappedResult result_;
+  std::optional<std::chrono::steady_clock::time_point> terminal_status_since_;
 
   bool createClient(const std::string& action_name);
 };
@@ -458,7 +466,7 @@ inline NodeStatus RosActionNode<T>::tick()
     goal_handle_.reset();
     future_goal_handle_ = {};
     on_feedback_state_change_ = NodeStatus::RUNNING;
-    result_ = {};
+    terminal_status_since_.reset();
     retireCallbacks();
     callback_state_ = std::make_shared<CallbackState>();
     callback_state_->owner = this;
@@ -574,10 +582,11 @@ inline NodeStatus RosActionNode<T>::tick()
     }
 
     std::vector<std::shared_ptr<const Feedback>> feedback;
+    std::optional<WrappedResult> result;
     {
       std::lock_guard<std::mutex> callback_lock(callback_state_->mutex);
       feedback = std::move(callback_state_->feedback);
-      result_ = callback_state_->result;
+      result = callback_state_->result;
     }
     for(const auto& message : feedback)
     {
@@ -599,20 +608,38 @@ inline NodeStatus RosActionNode<T>::tick()
       return Finish(on_feedback_state_change_);
     }
     // THIRD case: result received, requested a stop
-    if(result_.code != rclcpp_action::ResultCode::UNKNOWN &&
-       result_.goal_id == goal_handle_->get_goal_id())
+    if(result && result->goal_id == goal_handle_->get_goal_id())
     {
-      if(result_.code == rclcpp_action::ResultCode::ABORTED)
+      if(result->code == rclcpp_action::ResultCode::ABORTED)
       {
-        return Finish(onAborted(result_));
+        return Finish(onAborted(*result));
       }
-      else if(result_.code == rclcpp_action::ResultCode::CANCELED)
+      else if(result->code == rclcpp_action::ResultCode::CANCELED)
       {
         return Finish(onFailure(ACTION_CANCELLED));
       }
-      else
+      else if(result->code == rclcpp_action::ResultCode::SUCCEEDED)
       {
-        return Finish(onResultReceived(result_));
+        return Finish(onResultReceived(*result));
+      }
+      return Finish(onFailure(INVALID_RESULT));
+    }
+
+    // A terminal status is not a substitute for the action's result payload.
+    // Bound only this delivery gap; legitimately executing goals may take longer.
+    const auto goal_status = goal_handle_->get_status();
+    if(goal_status == action_msgs::msg::GoalStatus::STATUS_SUCCEEDED ||
+       goal_status == action_msgs::msg::GoalStatus::STATUS_ABORTED ||
+       goal_status == action_msgs::msg::GoalStatus::STATUS_CANCELED)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if(!terminal_status_since_)
+      {
+        terminal_status_since_ = now;
+      }
+      if(now - *terminal_status_since_ >= server_timeout_)
+      {
+        return Finish(onFailure(RESULT_TIMEOUT));
       }
     }
   }

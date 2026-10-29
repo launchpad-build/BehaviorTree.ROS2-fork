@@ -17,6 +17,11 @@ or halted nodes detach their inbox while pending late-acceptance cancellation
 remains active for that client's lifetime. The client and its executor must remain
 alive to receive acceptance.
 
+A received `UNKNOWN` result fails with `INVALID_RESULT`; it is not treated as a
+missing reply. If the server reports a terminal goal status but its result is
+missing, `server_timeout` bounds that delivery gap and fails with `RESULT_TIMEOUT`.
+This does not limit how long an executing goal may run, and never resends the goal.
+
 ### bool setGoal(Goal& goal)
 
 Required callback that allows the user to set the goal message.
