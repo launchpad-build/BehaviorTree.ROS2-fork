@@ -1,6 +1,7 @@
 #include "behaviortree_ros2/bt_action_node.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/executors.hpp"
+#include <thread>
 
 #include "behaviortree_ros2/plugins.hpp"
 
@@ -83,11 +84,23 @@ int main(int argc, char** argv)
 #endif
 
   auto tree = factory.createTreeFromText(xml_text);
+  std::thread spinner([&] { rclcpp::spin(nh); });
 
-  for(int i = 0; i < 5; i++)
+  try
   {
-    tree.tickWhileRunning();
+    for(int i = 0; i < 5; i++)
+    {
+      tree.tickWhileRunning();
+    }
+  }
+  catch(...)
+  {
+    rclcpp::shutdown();
+    spinner.join();
+    throw;
   }
 
+  rclcpp::shutdown();
+  spinner.join();
   return 0;
 }
